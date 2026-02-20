@@ -102,6 +102,17 @@ export class PaContext {
   get hasInput():  boolean { return this._inOpts  !== null; }
   get hasOutput(): boolean { return this._outOpts !== null; }
 
+  /**
+   * Returns the actual latency and sample rate negotiated by PortAudio for this
+   * stream, or null if the stream is not open.  Wraps Pa_GetStreamInfo.
+   */
+  getStreamInfo(): { inputLatency: number; outputLatency: number; sampleRate: number } | null {
+    if (!this._stream) return null;
+    const infoPtr = Pa_GetStreamInfo(this._stream);
+    if (!infoPtr) return null;
+    return decodeStreamInfo(infoPtr) as { inputLatency: number; outputLatency: number; sampleRate: number };
+  }
+
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
   /**

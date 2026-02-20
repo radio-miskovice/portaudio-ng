@@ -13,7 +13,7 @@
  *  - AudioIO() — open + immediate quit lifecycle (opens device then stops cleanly)
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
   SampleFormatFloat32, SampleFormat8Bit, SampleFormat16Bit,
   SampleFormat24Bit, SampleFormat32Bit,
@@ -175,6 +175,11 @@ describe('AudioIO() stream type', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('AudioIO() lifecycle', () => {
+  // WASAPI (and some other host APIs) hold an exclusive device handle for a
+  // short period after Pa_CloseStream returns.  Without a delay between tests
+  // Pa_OpenStream can fail with paUnanticipatedHostError (-9999).
+  beforeEach(() => new Promise(r => setTimeout(r, 250)));
+
   it('start() and abort() complete without error', async () => {
     const ao = AudioIO({ outOptions: { channelCount: 2, sampleFormat: SampleFormat16Bit, sampleRate: 44100 } });
     ao.start();
@@ -199,4 +204,72 @@ describe('AudioIO() lifecycle', () => {
       ao.end();
     });
   }, 10_000); // up to 10 s for the DAC to drain
+
+  it('getStreamInfo() returns latency and sampleRate after open', async () => {
+    const ao = AudioIO({ outOptions: { channelCount: 2, sampleFormat: SampleFormat16Bit, sampleRate: 44100 } });
+    const info = ao.getStreamInfo();
+    expect(info).not.toBeNull();
+    expect(typeof info!.outputLatency).toBe('number');
+    expect(info!.outputLatency).toBeGreaterThan(0);
+    expect(typeof info!.inputLatency).toBe('number');
+    expect(typeof info!.sampleRate).toBe('number');
+    expect(info!.sampleRate).toBeGreaterThan(0);
+    await ao.quit();
+  });
+
+  it('playBuffer() plays a buffer and resolves after DAC drains', async () => {
+    const ao = AudioIO({ outOptions: { channelCount: 1, sampleFormat: SampleFormat16Bit, sampleRate: 44100 } });
+    ao.start();
+    // 1024 silent frames — enough to exercise the write-callback → quit path
+    const silence = Buffer.alloc(1024 * 2, 0); // 1 ch * 2 bytes/sample
+    let finishedFired = false;
+    ao.on('finished', () => { finishedFired = true; });
+    await ao.playBuffer(silence);
+    expect(finishedFired).toBe(true);
+  }, 10_000);
+
+  it('plays three consecutive tones — 800 / 1200 / 1660 Hz, 0.25 s each, 10 % amplitude [physical verification]', async () => {
+    const sampleRate    = 44100;
+    const channelCount  = 2;      // stereo — broadest device compatibility
+    const toneDuration  = 0.25;   // seconds per tone
+    const amplitude     = 0.1;    // 10 % of full scale
+    const frequencies   = [800, 1200, 1660];
+
+    const bytesPerSample = 2;     // SampleFormat16Bit
+    const bytesPerFrame  = channelCount * bytesPerSample;
+    const framesPerTone  = Math.floor(sampleRate * toneDuration);
+
+    const ao = AudioIO({
+      outOptions: { channelCount, sampleFormat: SampleFormat16Bit, sampleRate, deviceId: -1 },
+    });
+    ao.start();
+
+    // Query actual hardware latency so the silence tail is sized correctly for
+    // the device (e.g. 91 ms for a Bluetooth headset vs ~5 ms for a wired DAC).
+    // Without this tail, the hardware's own queue is not fully drained when
+    // Pa_StopStream(WAIT) returns, and the last tone is audibly cut short.
+    const info            = ao.getStreamInfo()!;
+    // Use 2× the output latency as a safety margin; minimum 50 ms.
+    const tailSeconds     = Math.max(info.outputLatency * 2, 0.05);
+    const framesPerTail   = Math.ceil(info.sampleRate * tailSeconds);
+    const totalFrames     = framesPerTone * frequencies.length + framesPerTail;
+    const buf             = Buffer.alloc(totalFrames * bytesPerFrame, 0);
+
+    // Generate interleaved stereo PCM — same sine on both channels; tail stays silent
+    frequencies.forEach((freq, toneIndex) => {
+      for (let f = 0; f < framesPerTone; f++) {
+        const sample = Math.round(amplitude * 32767 * Math.sin(2 * Math.PI * freq * f / sampleRate));
+        const offset = (toneIndex * framesPerTone + f) * bytesPerFrame;
+        for (let ch = 0; ch < channelCount; ch++)
+          buf.writeInt16LE(sample, offset + ch * bytesPerSample);
+      }
+    });
+
+    let finishedFired = false;
+    ao.on('finished', () => { finishedFired = true; });
+
+    await ao.playBuffer(buf);   // blocks until the DAC has emitted the last sample
+
+    expect(finishedFired).toBe(true);
+  }, 15_000); // 0.75 s of audio + tail + device open/close overhead
 });

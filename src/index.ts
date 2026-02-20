@@ -63,6 +63,19 @@ export interface AudioOptions {
 }
 
 /**
+ * Actual stream parameters negotiated by PortAudio after the stream is opened.
+ * Returned by `getStreamInfo()`.
+ */
+export interface StreamInfo {
+  /** Actual input latency in seconds (0 for output-only streams). */
+  readonly inputLatency:  number;
+  /** Actual output latency in seconds (0 for input-only streams). */
+  readonly outputLatency: number;
+  /** Actual sample rate negotiated with the device. */
+  readonly sampleRate:    number;
+}
+
+/**
  * Methods added by AudioIO to every returned Node.js stream.
  * Call `start()` after attaching all event listeners.
  */
@@ -80,13 +93,63 @@ export interface IoStream {
    * Resolves when the stream is idle.
    */
   abort(callback?: () => void): Promise<void>;
+  /**
+   * Returns the actual latency and sample rate negotiated by PortAudio for
+   * this stream, or null if the stream has not been opened yet.
+   * Use this to dynamically size trailing silence instead of hardcoding a
+   * delay based on a logged message.
+   */
+  getStreamInfo(): StreamInfo | null;
 }
 
 /** Returned when only `inOptions` is provided. */
 export interface IoStreamRead extends IoStream, NodeJS.ReadableStream {}
 
-/** Returned when only `outOptions` is provided. */
-export interface IoStreamWrite extends IoStream, NodeJS.WritableStream {}
+/**
+ * Returned when only `outOptions` is provided.
+ *
+ * ### Writing audio
+ *
+ * `write()` follows the standard Node.js `Writable` contract:
+ * - Returns `false` when the internal buffer is full (backpressure); listen for
+ *   `'drain'` before writing more.
+ * - The optional callback fires once the chunk has been **flushed to the
+ *   PortAudio ring buffer** — not when the DAC has played it.
+ *
+ * ### Correct pattern for writing a buffer and waiting for DAC completion
+ *
+ * ```js
+ * // WRONG — quit() races against the Node.js stream buffer:
+ * ao.write(audioBuffer);
+ * await ao.quit();   // may cut off audio early!
+ *
+ * // CORRECT — wait for the write callback before calling quit():
+ * await new Promise(resolve => ao.write(audioBuffer, resolve));
+ * await ao.quit();   // now guaranteed to drain
+ *
+ * // OR — use the first-class helper:
+ * await ao.playBuffer(audioBuffer);
+ * ```
+ *
+ * See also the README section "The two-buffer problem".
+ */
+export interface IoStreamWrite extends IoStream, NodeJS.WritableStream {
+  /**
+   * Write `buffer` to the output stream and wait for the DAC to physically
+   * play the last sample.
+   *
+   * Equivalent to:
+   * ```js
+   * await new Promise(resolve => ao.write(buffer, resolve));
+   * await ao.quit();
+   * ```
+   *
+   * Resolves only after `Pa_StopStream(WAIT)` completes (the same guarantee as
+   * `await ao.quit()`).  The `'finished'` event fires just before this Promise
+   * resolves.
+   */
+  playBuffer(buffer: Buffer): Promise<void>;
+}
 
 /** Returned when both `inOptions` and `outOptions` are provided. */
 export interface IoStreamDuplex extends IoStream, NodeJS.ReadableStream, NodeJS.WritableStream {}
@@ -170,6 +233,31 @@ export function AudioIO(
 
   // ── Create the appropriate Node stream subclass ──────────────────────────
 
+  // 'finished' must fire exactly once — whether triggered by end()/_final or
+  // by a direct quit() call (e.g. from playBuffer).
+  let finishedEmitted = false;
+  const emitFinished = (): void => {
+    if (!finishedEmitted) {
+      finishedEmitted = true;
+      ioStream.emit('finished');
+    }
+  };
+
+  // For output (Writable / Duplex), we implement _final() rather than listening
+  // to 'finish'.  _final(cb) is called after the last _write() completes but
+  // BEFORE 'finish' fires — so Pa_StopStream(WAIT) runs while Node.js still
+  // considers the stream open, eliminating the race between the Node.js stream
+  // teardown and PortAudio consuming its ring buffer.
+  const doFinal = async (cb: (err?: Error | null) => void): Promise<void> => {
+    try {
+      await paCtx.stop('WAIT');
+      emitFinished();
+      cb();
+    } catch (err) {
+      cb(err as Error);
+    }
+  };
+
   let ioStream: Readable | Writable | Duplex;
   if (inOpts && outOpts) {
     ioStream = new Duplex({
@@ -180,6 +268,7 @@ export function AudioIO(
       writableHighWaterMark: outOpts.highwaterMark,
       read:  doRead,
       write: doWrite,
+      final: doFinal,
     });
   } else if (inOpts) {
     ioStream = new Readable({
@@ -193,18 +282,20 @@ export function AudioIO(
       decodeStrings:  false,
       objectMode:     false,
       write:          doWrite,
+      final:          doFinal,
     });
   }
 
   // ── Control methods ──────────────────────────────────────────────────────
 
-  const s = ioStream as typeof ioStream & IoStream;
+  const s = ioStream as typeof ioStream & IoStream & { playBuffer?: (b: Buffer) => Promise<void> };
 
   s.start = (): void => paCtx.start();
 
   s.quit = async (cb?: () => void): Promise<void> => {
     await paCtx.stop('WAIT' as StopFlag);
     if (paCtx.hasInput) endInput();
+    if (outOpts) emitFinished();
     if (typeof cb === 'function') cb();
   };
 
@@ -214,6 +305,27 @@ export function AudioIO(
     if (typeof cb === 'function') cb();
   };
 
+  s.getStreamInfo = (): StreamInfo | null => paCtx.getStreamInfo();
+
+  // playBuffer — write-only/duplex streams only
+  if (outOpts) {
+    (s as typeof s & { playBuffer: (b: Buffer) => Promise<void> }).playBuffer =
+      (buffer: Buffer): Promise<void> =>
+        new Promise<void>((resolve, reject) => {
+          // write() callback fires when the chunk has been flushed to
+          // PortAudio's ring buffer (i.e., _write's cb has been called).
+          // After that, quit() blocks via Pa_StopStream(WAIT) until the
+          // DAC physically plays the last sample.
+          const written = (ioStream as Writable).write(buffer, (err) => {
+            if (err) { reject(err); return; }
+            s.quit().then(resolve, reject);
+          });
+          // If write() returned false (backpressure), the callback above will
+          // still fire once the chunk is processed — no extra action needed here.
+          void written;
+        });
+  }
+
   // ── Lifecycle events ─────────────────────────────────────────────────────
 
   // 'close' → 'closed'  (preserved from original naudiodon API)
@@ -221,18 +333,17 @@ export function AudioIO(
     ioStream.emit('closed');
   });
 
-  // 'finish' fires when the Node Writable has processed all .write() chunks.
-  // At that point PortAudio's internal ring buffer may still hold up to one
-  // output-latency worth of audio.  Pa_StopStream(WAIT) — on a libuv thread —
-  // blocks until the DAC physically emits the last sample.
-  //
-  // Event sequence:  'finish' → Pa_StopStream(WAIT) → 'finished'
-  ioStream.on('finish', async () => {
-    await paCtx.stop('WAIT');
-    ioStream.emit('finished');
-  });
+  // For output streams, Pa_StopStream(WAIT) is now called from _final() which
+  // runs before 'finish' fires — the 'finished' event is emitted from there,
+  // or from quit() if called directly.
+  // For input-only streams there is no _final(); emit 'finished' on 'end'.
+  if (!outOpts) {
+    ioStream.on('end', () => {
+      emitFinished();
+    });
+  }
 
   ioStream.on('error', (err: Error) => console.error('AudioIO:', err));
 
-  return s as IoStreamRead | IoStreamWrite | IoStreamDuplex;
+  return s as unknown as IoStreamRead | IoStreamWrite | IoStreamDuplex;
 }

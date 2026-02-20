@@ -34,6 +34,15 @@ export declare class PaContext {
     get hasInput(): boolean;
     get hasOutput(): boolean;
     /**
+     * Returns the actual latency and sample rate negotiated by PortAudio for this
+     * stream, or null if the stream is not open.  Wraps Pa_GetStreamInfo.
+     */
+    getStreamInfo(): {
+        inputLatency: number;
+        outputLatency: number;
+        sampleRate: number;
+    } | null;
+    /**
      * Pa_Initialize + Pa_OpenStream (blocking/null-callback mode).
      * This is fast (< 1 ms on most systems) and safe to call synchronously.
      */
