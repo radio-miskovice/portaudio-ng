@@ -1,0 +1,5 @@
+Get and extract the sources
+
+./configure MACOSX_DEPLOYMENT_TARGET=10.6
+cp libs/.libs/libportaudio.dylib ../naudiodon/portaudio/bin/
+install_name_tool -id @rpath/libportaudio.dylib portaudio/bin/libportaudio.dylib

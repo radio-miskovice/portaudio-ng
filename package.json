@@ -1,0 +1,29 @@
+{
+  "name": "portaudio-ng",
+  "version": "1.0.0",
+  "description": "Node Stream bindings for PortAudio.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "keywords": [
+    "portaudio",
+    "audio",
+    "play",
+    "record",
+    "wav",
+    "raspberry pi"
+  ],
+  "dependencies": {
+    "koffi": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.0.0"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  }
+}
